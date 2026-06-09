@@ -1,0 +1,20 @@
+# Secretos — NUNCA subir
+.env
+*.env
+!.env.example
+
+# Entorno virtual
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Lockfiles de uv (opcional dejarlos, aquí se ignoran)
+uv.lock
+
+# Config local de Claude Code
+.claude/
+
+# Sistema
+.DS_Store
+Thumbs.db

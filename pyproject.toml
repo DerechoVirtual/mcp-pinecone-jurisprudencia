@@ -1,0 +1,11 @@
+[project]
+name = "pinecone-jurisprudencia-mcp"
+version = "0.1.0"
+description = "Servidor MCP de busqueda semantica en Pinecone (jurisprudencia y normativa) para Claude Desktop"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "openai>=1.40.0",
+    "pinecone>=5.0.0",
+    "python-dotenv>=1.0.0",
+]
