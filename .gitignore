@@ -15,6 +15,10 @@ uv.lock
 # Config local de Claude Code
 .claude/
 
+# Instaladores especificos de la maquina de Carlos (rutas absolutas locales)
+instalar_en_claude_desktop.py
+instalar_en_claude_desktop.bat
+
 # Sistema
 .DS_Store
 Thumbs.db
