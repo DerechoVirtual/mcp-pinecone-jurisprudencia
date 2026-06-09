@@ -7,25 +7,32 @@ el servidor embebe tu consulta y devuelve los registros más parecidos de tu
 índice, con su puntuación de similitud y sus metadatos.
 
 No está atado a ningún dominio: sirve para jurisprudencia, documentación técnica,
-base de conocimiento, soporte, RAG… **Tú pones tu propia API key y tu propio
-índice** mediante un archivo `.env`. Este repositorio **no contiene credenciales
-ni datos**.
+base de conocimiento, soporte, RAG… **Solo necesitas tu clave de Pinecone y tu
+índice.** Este repositorio **no contiene credenciales ni datos**.
 
 ## Cómo funciona
 
 1. Recibe una consulta de texto.
-2. La convierte en un vector con OpenAI (`text-embedding-3-large` por defecto).
+2. La convierte en un vector. **Por defecto lo hace el propio Pinecone**
+   (Pinecone Inference, modelo `multilingual-e5-large`) — solo con tu clave de
+   Pinecone, sin ninguna otra. Opcionalmente puede usar OpenAI (ver abajo).
 3. Consulta tu índice de Pinecone (`query`, `top_k`, `include_metadata`).
 4. Devuelve los resultados formateados (texto + metadatos + similitud).
 
-> El modelo de embeddings debe producir vectores de la **misma dimensión** que
-> tu índice (`text-embedding-3-large` = 3072, `text-embedding-3-small` = 1536).
+> El modelo de embebido debe **coincidir** con el que se usó para crear el índice
+> (mismo modelo y misma dimensión).
+
+### Embebido: Pinecone (por defecto) u OpenAI (opcional)
+
+- **Pinecone (por defecto):** no requiere ninguna clave aparte de la de Pinecone.
+- **OpenAI (opcional):** solo si tu índice se creó con embeddings de OpenAI.
+  Define `OPENAI_API_KEY` y `EMBED_MODEL=text-embedding-3-large` (o `-small`).
 
 ## Requisitos
 
 - Python 3.10+
 - Una cuenta de [Pinecone](https://app.pinecone.io) con un índice ya poblado.
-- Una API key de [OpenAI](https://platform.openai.com) (para los embeddings).
+- *(Opcional)* una API key de OpenAI, **solo** si tu índice usa embeddings de OpenAI.
 
 ## Instalación
 
@@ -39,7 +46,7 @@ uv pip install mcp openai pinecone python-dotenv
 
 # Configura tus claves
 cp .env.example .env   # en Windows: copy .env.example .env
-# edita .env y rellena PINECONE_API_KEY, OPENAI_API_KEY y PINECONE_INDEX
+# edita .env y rellena PINECONE_API_KEY y PINECONE_INDEX (nada más es obligatorio)
 ```
 
 ## Configuración (`.env`)
@@ -47,9 +54,9 @@ cp .env.example .env   # en Windows: copy .env.example .env
 | Variable | Obligatoria | Descripción |
 |---|---|---|
 | `PINECONE_API_KEY` | ✅ | Tu API key de Pinecone |
-| `OPENAI_API_KEY` | ✅ | Tu API key de OpenAI (embeddings) |
 | `PINECONE_INDEX` | ✅ | Índice por defecto donde buscar |
-| `EMBED_MODEL` | ❌ | Modelo de embeddings (def. `text-embedding-3-large`) |
+| `EMBED_MODEL` | ❌ | Modelo de embebido. Def. `multilingual-e5-large` (Pinecone) |
+| `OPENAI_API_KEY` | ❌ | Solo si tu índice usa embeddings de OpenAI |
 | `PINECONE_NAMESPACE` | ❌ | Namespace por defecto |
 | `TEXT_FIELD` | ❌ | Campo de metadata con el texto (si no, se autodetecta) |
 | `PINECONE_INDEX_ALIASES` | ❌ | JSON de alias → índice, p. ej. `{"docs":"mi-indice-docs"}` |

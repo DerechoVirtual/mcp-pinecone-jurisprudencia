@@ -2,18 +2,26 @@
 Servidor MCP — Búsqueda semántica genérica en Pinecone.
 
 Conecta CUALQUIER índice de Pinecone con un cliente MCP (p. ej. Claude Desktop)
-para hacer búsqueda semántica de SOLO LECTURA. No está atado a ningún dominio:
-sirve para jurisprudencia, documentación, soporte, RAG, etc. — tú pones tu
-propia API key y tu propio índice mediante variables de entorno (.env).
+para hacer búsqueda semántica de SOLO LECTURA. No está atado a ningún dominio.
 
-Embeddings: por defecto OpenAI `text-embedding-3-large`. El modelo DEBE producir
-vectores de la misma dimensión que el índice de Pinecone consultado.
+>> SOLO necesitas tu clave de Pinecone. <<
+Por defecto, el embebido de la consulta lo hace el propio Pinecone (Pinecone
+Inference), así que no requiere ninguna otra clave.
+
+Embebido (cómo se convierte la consulta en vector):
+  - Por defecto: Pinecone Inference (modelo `multilingual-e5-large`). Solo Pinecone.
+  - Opcional: OpenAI, SOLO si defines OPENAI_API_KEY y un EMBED_MODEL de OpenAI
+    (p. ej. text-embedding-3-large). Útil si tu índice se creó con embeddings
+    de OpenAI.
+
+El modelo de embebido DEBE coincidir con el que se usó para crear el índice
+(mismo modelo y misma dimensión).
 
 Configuración (.env — ver .env.example):
   PINECONE_API_KEY        (obligatoria)
-  OPENAI_API_KEY          (obligatoria, para embeber la consulta)
   PINECONE_INDEX          (obligatoria) índice por defecto donde buscar
-  EMBED_MODEL             (opcional) modelo de embeddings, def. text-embedding-3-large
+  EMBED_MODEL             (opcional) modelo de embebido
+  OPENAI_API_KEY          (opcional)  solo para índices embebidos con OpenAI
   PINECONE_NAMESPACE      (opcional) namespace por defecto
   TEXT_FIELD              (opcional) campo de metadata con el texto a mostrar
   PINECONE_INDEX_ALIASES  (opcional) JSON {"alias":"nombre-real-indice", ...}
@@ -29,7 +37,6 @@ for _name in ("pinecone", "httpx", "openai"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from pinecone import Pinecone
 from mcp.server.fastmcp import FastMCP
 
@@ -37,13 +44,12 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DEFAULT_INDEX = os.environ.get("PINECONE_INDEX", "").strip()
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-large").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "").strip()
 DEFAULT_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "").strip()
 TEXT_FIELD = os.environ.get("TEXT_FIELD", "").strip()
 
-# Alias opcionales de índice (JSON): {"familia": "jurisprudencia-derecho-familia"}
 try:
     INDEX_ALIASES = json.loads(os.environ.get("PINECONE_INDEX_ALIASES", "") or "{}")
     if not isinstance(INDEX_ALIASES, dict):
@@ -51,22 +57,31 @@ try:
 except json.JSONDecodeError:
     INDEX_ALIASES = {}
 
-# Campos de metadata candidatos a contener el texto principal del documento
 _TEXT_CANDIDATES = [
     "text", "texto", "content", "contenido", "chunk_text",
     "page_content", "body", "passage",
 ]
 
-if not PINECONE_API_KEY or not OPENAI_API_KEY:
-    sys.stderr.write("ERROR: faltan PINECONE_API_KEY u OPENAI_API_KEY en el .env\n")
+if not PINECONE_API_KEY:
+    sys.stderr.write("ERROR: falta PINECONE_API_KEY en el .env\n")
     sys.exit(1)
 if not DEFAULT_INDEX:
     sys.stderr.write("ERROR: falta PINECONE_INDEX en el .env (índice por defecto)\n")
     sys.exit(1)
 
-_openai = OpenAI(api_key=OPENAI_API_KEY)
+# --- Selección del proveedor de embebido ---------------------------------
+# OpenAI solo si hay clave Y (no se fija modelo o el modelo es de OpenAI).
+_model_is_openai = EMBED_MODEL.startswith("text-embedding")
+if OPENAI_API_KEY and (not EMBED_MODEL or _model_is_openai):
+    EMBED_PROVIDER = "openai"
+    EMBED_MODEL = EMBED_MODEL or "text-embedding-3-large"
+else:
+    EMBED_PROVIDER = "pinecone"
+    EMBED_MODEL = EMBED_MODEL or "multilingual-e5-large"
+
 _pc = Pinecone(api_key=PINECONE_API_KEY)
 _index_cache: dict[str, object] = {}
+_openai_client = None  # se crea de forma perezosa solo si se usa OpenAI
 
 mcp = FastMCP("pinecone-search")
 
@@ -77,7 +92,7 @@ def _resolver_indice(indice: str) -> str:
         return DEFAULT_INDEX
     if indice in INDEX_ALIASES:
         return INDEX_ALIASES[indice]
-    return indice  # se asume que es el nombre real del índice
+    return indice
 
 
 def _get_index(nombre_real: str):
@@ -87,12 +102,25 @@ def _get_index(nombre_real: str):
 
 
 def _embed(texto: str) -> list[float]:
-    resp = _openai.embeddings.create(model=EMBED_MODEL, input=texto)
-    return resp.data[0].embedding
+    """Convierte el texto en vector. Pinecone por defecto; OpenAI si está activo."""
+    if EMBED_PROVIDER == "openai":
+        global _openai_client
+        if _openai_client is None:
+            from openai import OpenAI
+            _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = _openai_client.embeddings.create(model=EMBED_MODEL, input=texto)
+        return resp.data[0].embedding
+    # Pinecone Inference (solo clave de Pinecone)
+    r = _pc.inference.embed(
+        model=EMBED_MODEL,
+        inputs=[texto],
+        parameters={"input_type": "query"},
+    )
+    d = r.data[0]
+    return d["values"] if isinstance(d, dict) else d.values
 
 
 def _extraer_texto(meta: dict) -> tuple[str | None, str | None]:
-    """Devuelve (clave_del_texto, texto) usando TEXT_FIELD o candidatos comunes."""
     if TEXT_FIELD and TEXT_FIELD in meta:
         return TEXT_FIELD, str(meta[TEXT_FIELD])
     for c in _TEXT_CANDIDATES:
@@ -115,8 +143,7 @@ def pinecone_search(
     Args:
         query: Texto a buscar en lenguaje natural.
         index: Índice donde buscar. Vacío = índice por defecto (PINECONE_INDEX).
-            Acepta el nombre real del índice o un alias definido en
-            PINECONE_INDEX_ALIASES.
+            Acepta el nombre real del índice o un alias de PINECONE_INDEX_ALIASES.
         top_k: Número de resultados a devolver (1-50, por defecto 5).
         namespace: Namespace de Pinecone (vacío = el del .env o el por defecto).
 
@@ -135,7 +162,7 @@ def pinecone_search(
     try:
         vector = _embed(query)
     except Exception as e:  # noqa: BLE001
-        return f"Error al generar el embedding con OpenAI ({EMBED_MODEL}): {e}"
+        return f"Error al generar el embebido ({EMBED_PROVIDER}/{EMBED_MODEL}): {e}"
 
     try:
         idx = _get_index(nombre_real)
@@ -177,7 +204,6 @@ def pinecone_search(
                 texto = texto[:1500] + " […]"
             lineas.append(texto)
 
-        # Resto de metadatos (sin repetir el campo de texto)
         otros = []
         for k, v in meta.items():
             if k == text_key:
