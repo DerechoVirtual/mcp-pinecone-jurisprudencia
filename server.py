@@ -1,69 +1,83 @@
 """
-Servidor MCP — Búsqueda semántica en Pinecone (jurisprudencia y normativa).
+Servidor MCP — Búsqueda semántica genérica en Pinecone.
 
-Conecta los índices de Pinecone de Derecho Virtual con Claude (Claude Desktop)
-para hacer búsqueda semántica de SOLO LECTURA sobre jurisprudencia y normativa
-española ya indexada.
+Conecta CUALQUIER índice de Pinecone con un cliente MCP (p. ej. Claude Desktop)
+para hacer búsqueda semántica de SOLO LECTURA. No está atado a ningún dominio:
+sirve para jurisprudencia, documentación, soporte, RAG, etc. — tú pones tu
+propia API key y tu propio índice mediante variables de entorno (.env).
 
-Embeddings: OpenAI text-embedding-3-large (3072 dim) — debe coincidir con la
-dimensión de los índices.
+Embeddings: por defecto OpenAI `text-embedding-3-large`. El modelo DEBE producir
+vectores de la misma dimensión que el índice de Pinecone consultado.
 
-Autor: generado para Carlos Rivero (Derecho Virtual).
+Configuración (.env — ver .env.example):
+  PINECONE_API_KEY        (obligatoria)
+  OPENAI_API_KEY          (obligatoria, para embeber la consulta)
+  PINECONE_INDEX          (obligatoria) índice por defecto donde buscar
+  EMBED_MODEL             (opcional) modelo de embeddings, def. text-embedding-3-large
+  PINECONE_NAMESPACE      (opcional) namespace por defecto
+  TEXT_FIELD              (opcional) campo de metadata con el texto a mostrar
+  PINECONE_INDEX_ALIASES  (opcional) JSON {"alias":"nombre-real-indice", ...}
 """
 
+import json
 import logging
 import os
 import sys
 
-# Silenciar logs de las librerías para no ensuciar el canal MCP (stdio)
-logging.getLogger("pinecone").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+# Silenciar logs de librerías para no ensuciar el canal MCP (stdio)
+for _name in ("pinecone", "httpx", "openai"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from pinecone import Pinecone
 from mcp.server.fastmcp import FastMCP
 
-# Cargar claves desde el .env que está junto a este archivo
+# Cargar variables del .env que está junto a este archivo
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-large")
+DEFAULT_INDEX = os.environ.get("PINECONE_INDEX", "").strip()
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-large").strip()
+DEFAULT_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "").strip()
+TEXT_FIELD = os.environ.get("TEXT_FIELD", "").strip()
+
+# Alias opcionales de índice (JSON): {"familia": "jurisprudencia-derecho-familia"}
+try:
+    INDEX_ALIASES = json.loads(os.environ.get("PINECONE_INDEX_ALIASES", "") or "{}")
+    if not isinstance(INDEX_ALIASES, dict):
+        INDEX_ALIASES = {}
+except json.JSONDecodeError:
+    INDEX_ALIASES = {}
+
+# Campos de metadata candidatos a contener el texto principal del documento
+_TEXT_CANDIDATES = [
+    "text", "texto", "content", "contenido", "chunk_text",
+    "page_content", "body", "passage",
+]
 
 if not PINECONE_API_KEY or not OPENAI_API_KEY:
-    sys.stderr.write(
-        "ERROR: faltan PINECONE_API_KEY u OPENAI_API_KEY en el .env\n"
-    )
+    sys.stderr.write("ERROR: faltan PINECONE_API_KEY u OPENAI_API_KEY en el .env\n")
+    sys.exit(1)
+if not DEFAULT_INDEX:
+    sys.stderr.write("ERROR: falta PINECONE_INDEX en el .env (índice por defecto)\n")
     sys.exit(1)
 
-# Índices disponibles (todos 3072 dim, modelo text-embedding-3-large).
-# clave amigable -> nombre real del índice en Pinecone
-INDICES = {
-    "familia": "jurisprudencia-derecho-familia",   # ~592 STS de derecho de familia
-    "lec": "lec-espana",                            # Ley de Enjuiciamiento Civil (Ley 1/2000)
-    "temario-justicia": "rag-temario-justicia",     # temario oposiciones Justicia
-    "temario-justicia-openai": "rag-temario-justicia-openai",
-}
-INDICE_POR_DEFECTO = "familia"
-
-# Clientes (se crean una vez al arrancar)
 _openai = OpenAI(api_key=OPENAI_API_KEY)
 _pc = Pinecone(api_key=PINECONE_API_KEY)
 _index_cache: dict[str, object] = {}
 
-mcp = FastMCP("pinecone-jurisprudencia")
+mcp = FastMCP("pinecone-search")
 
 
 def _resolver_indice(indice: str) -> str:
-    """Acepta una clave amigable ('familia') o el nombre real del índice."""
-    if indice in INDICES:
-        return INDICES[indice]
-    # Si pasan directamente el nombre real, lo aceptamos también
-    if indice in INDICES.values():
-        return indice
-    return INDICES[INDICE_POR_DEFECTO]
+    indice = (indice or "").strip()
+    if not indice:
+        return DEFAULT_INDEX
+    if indice in INDEX_ALIASES:
+        return INDEX_ALIASES[indice]
+    return indice  # se asume que es el nombre real del índice
 
 
 def _get_index(nombre_real: str):
@@ -77,94 +91,105 @@ def _embed(texto: str) -> list[float]:
     return resp.data[0].embedding
 
 
+def _extraer_texto(meta: dict) -> tuple[str | None, str | None]:
+    """Devuelve (clave_del_texto, texto) usando TEXT_FIELD o candidatos comunes."""
+    if TEXT_FIELD and TEXT_FIELD in meta:
+        return TEXT_FIELD, str(meta[TEXT_FIELD])
+    for c in _TEXT_CANDIDATES:
+        if c in meta and meta[c]:
+            return c, str(meta[c])
+    return None, None
+
+
 @mcp.tool()
-def buscar_jurisprudencia(
-    consulta: str,
-    indice: str = INDICE_POR_DEFECTO,
+def pinecone_search(
+    query: str,
+    index: str = "",
     top_k: int = 5,
+    namespace: str = "",
 ) -> str:
-    """Busca semánticamente en una base de datos vectorial (Pinecone) de
-    jurisprudencia y normativa española y devuelve los fragmentos más
-    relevantes con su cita y metadatos.
+    """Búsqueda semántica en un índice de Pinecone. Embebe la consulta y
+    devuelve los registros más parecidos con su puntuación de similitud y sus
+    metadatos.
 
     Args:
-        consulta: Pregunta o texto a buscar (lenguaje natural). Ej.:
-            "extinción de la pensión compensatoria por convivencia marital".
-        indice: Base de datos donde buscar. Opciones:
-            - "familia": jurisprudencia del Tribunal Supremo en derecho de
-              familia (divorcio, custodia, pensión compensatoria, alimentos,
-              vivienda familiar, régimen económico). [por defecto]
-            - "lec": articulado de la Ley de Enjuiciamiento Civil (Ley 1/2000).
-            - "temario-justicia": temario de oposiciones de Justicia.
-            - "temario-justicia-openai": variante del temario de Justicia.
-        top_k: Número de fragmentos a devolver (por defecto 5, máx. 20).
+        query: Texto a buscar en lenguaje natural.
+        index: Índice donde buscar. Vacío = índice por defecto (PINECONE_INDEX).
+            Acepta el nombre real del índice o un alias definido en
+            PINECONE_INDEX_ALIASES.
+        top_k: Número de resultados a devolver (1-50, por defecto 5).
+        namespace: Namespace de Pinecone (vacío = el del .env o el por defecto).
 
     Returns:
-        Texto con los fragmentos más relevantes, su cita/fuente, metadatos y
-        puntuación de similitud (0-1).
+        Texto con los resultados: puntuación, texto principal (si existe en los
+        metadatos) y el resto de metadatos de cada coincidencia.
     """
-    consulta = (consulta or "").strip()
-    if not consulta:
+    query = (query or "").strip()
+    if not query:
         return "Error: la consulta está vacía."
 
-    top_k = max(1, min(int(top_k), 20))
-    nombre_real = _resolver_indice(indice)
+    top_k = max(1, min(int(top_k), 50))
+    nombre_real = _resolver_indice(index)
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip()
 
     try:
-        vector = _embed(consulta)
+        vector = _embed(query)
     except Exception as e:  # noqa: BLE001
-        return f"Error al generar el embedding con OpenAI: {e}"
+        return f"Error al generar el embedding con OpenAI ({EMBED_MODEL}): {e}"
 
     try:
-        index = _get_index(nombre_real)
-        res = index.query(
-            vector=vector,
-            top_k=top_k,
-            include_metadata=True,
-        )
+        idx = _get_index(nombre_real)
+        kwargs = {"vector": vector, "top_k": top_k, "include_metadata": True}
+        if ns:
+            kwargs["namespace"] = ns
+        res = idx.query(**kwargs)
     except Exception as e:  # noqa: BLE001
         return f"Error al consultar Pinecone (índice '{nombre_real}'): {e}"
 
     matches = res.get("matches", []) if isinstance(res, dict) else getattr(res, "matches", [])
     if not matches:
-        return (
-            f"No se encontraron resultados en el índice '{nombre_real}' "
-            f"para: {consulta!r}"
-        )
+        return f"Sin resultados en el índice '{nombre_real}' para: {query!r}"
 
     lineas = [
-        f"Resultados de '{nombre_real}' para: {consulta!r}",
-        f"({len(matches)} fragmentos, ordenados por relevancia)\n",
+        f"Resultados de '{nombre_real}'"
+        + (f" (namespace: {ns})" if ns else "")
+        + f" para: {query!r}",
+        f"({len(matches)} coincidencias, ordenadas por relevancia)\n",
     ]
 
     for i, m in enumerate(matches, 1):
         if isinstance(m, dict):
-            score = m.get("score", 0.0)
+            score = m.get("score", 0.0) or 0.0
             meta = m.get("metadata", {}) or {}
+            _id = m.get("id", "")
         else:
             score = getattr(m, "score", 0.0) or 0.0
             meta = getattr(m, "metadata", {}) or {}
+            _id = getattr(m, "id", "")
 
-        # Construir una cita legible a partir de los metadatos disponibles
-        cita_partes = []
-        for campo in ("referencia", "articulo", "rubrica", "fecha", "tribunal",
-                       "materia", "numero_resolucion", "ecli", "fuente"):
-            val = meta.get(campo)
-            if val:
-                cita_partes.append(f"{campo}: {val}")
-        cita = " · ".join(cita_partes) if cita_partes else "(sin metadatos de cita)"
+        meta = dict(meta)
+        text_key, texto = _extraer_texto(meta)
 
-        texto = meta.get("texto") or meta.get("text") or "(sin texto en metadata)"
-        if len(texto) > 1500:
-            texto = texto[:1500] + " […]"
+        lineas.append(f"--- Resultado {i} | similitud {score:.3f} | id: {_id} ---")
 
-        link = meta.get("link") or meta.get("url")
+        if texto is not None:
+            if len(texto) > 1500:
+                texto = texto[:1500] + " […]"
+            lineas.append(texto)
 
-        lineas.append(f"--- Resultado {i} | similitud {score:.3f} ---")
-        lineas.append(cita)
-        if link:
-            lineas.append(f"Enlace: {link}")
-        lineas.append(texto)
+        # Resto de metadatos (sin repetir el campo de texto)
+        otros = []
+        for k, v in meta.items():
+            if k == text_key:
+                continue
+            sval = str(v)
+            if len(sval) > 300:
+                sval = sval[:300] + " […]"
+            otros.append(f"  {k}: {sval}")
+        if otros:
+            lineas.append("metadatos:")
+            lineas.extend(otros)
+
         lineas.append("")
 
     return "\n".join(lineas)
